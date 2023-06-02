@@ -3,6 +3,7 @@
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "CPP_COMPILE_ACTION_NAME", "C_COMPILE_ACTION_NAME")
 load("@bazel_tools//tools/cpp:toolchain_utils.bzl", "find_cpp_toolchain")
+load("//cargo:features.bzl", "SYMLINK_EXEC_ROOT_FEATURE")
 load("//rust:defs.bzl", "rust_common")
 
 # buildifier: disable=bzl-visibility
@@ -13,34 +14,10 @@ load("//rust/private:rustc.bzl", "BuildInfo", "get_compilation_mode_opts", "get_
 
 # buildifier: disable=bzl-visibility
 load("//rust/private:utils.bzl", "dedent", "expand_dict_value_locations", "find_cc_toolchain", "find_toolchain", _name_to_crate_name = "name_to_crate_name")
+load(":features.bzl", "feature_enabled")
 
 # Reexport for cargo_build_script_wrapper.bzl
 name_to_crate_name = _name_to_crate_name
-
-def strip_target(elems):
-    """Remove '-target xxx' from C(XX)FLAGS.
-
-    The cpp toolchain adds '-target xxx' and '-isysroot xxx' to CFLAGS. If it is not stripped out before
-    the CFLAGS are provided to build scripts, it can cause the build to take on the host architecture
-    instead of the target architecture.
-
-    Args:
-        elems (list): A list of args
-
-    Returns:
-        list: the modified args
-    """
-    skip_next = False
-    out_elems = []
-    for elem in elems:
-        if skip_next:
-            skip_next = False
-            continue
-        if elem == "-target" or elem == "-isysroot":
-            skip_next = True
-            continue
-        out_elems.append(elem)
-    return out_elems
 
 def get_cc_compile_args_and_env(cc_toolchain, feature_configuration):
     """Gather cc environment variables from the given `cc_toolchain`
@@ -59,16 +36,16 @@ def get_cc_compile_args_and_env(cc_toolchain, feature_configuration):
         feature_configuration = feature_configuration,
         cc_toolchain = cc_toolchain,
     )
-    cc_c_args = strip_target(cc_common.get_memory_inefficient_command_line(
+    cc_c_args = cc_common.get_memory_inefficient_command_line(
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
         variables = compile_variables,
-    ))
-    cc_cxx_args = strip_target(cc_common.get_memory_inefficient_command_line(
+    )
+    cc_cxx_args = cc_common.get_memory_inefficient_command_line(
         feature_configuration = feature_configuration,
         action_name = CPP_COMPILE_ACTION_NAME,
         variables = compile_variables,
-    ))
+    )
     cc_env = cc_common.get_environment_variables(
         feature_configuration = feature_configuration,
         action_name = C_COMPILE_ACTION_NAME,
@@ -133,7 +110,7 @@ def _cargo_build_script_impl(ctx):
         "CARGO_CRATE_NAME": name_to_crate_name(pkg_name),
         "CARGO_MANIFEST_DIR": manifest_dir,
         "CARGO_PKG_NAME": pkg_name,
-        "HOST": toolchain.exec_triple,
+        "HOST": toolchain.exec_triple.str,
         "NUM_JOBS": "1",
         "OPT_LEVEL": compilation_mode_opt_level,
         "RUSTC": toolchain.rustc.path,
@@ -159,7 +136,7 @@ def _cargo_build_script_impl(ctx):
     # Pull in env vars which may be required for the cc_toolchain to work (e.g. on OSX, the SDK version).
     # We hope that the linker env is sufficient for the whole cc_toolchain.
     cc_toolchain, feature_configuration = find_cc_toolchain(ctx)
-    linker, link_args, linker_env = get_linker_and_args(ctx, ctx.attr, cc_toolchain, feature_configuration, None)
+    linker, link_args, linker_env = get_linker_and_args(ctx, ctx.attr, "bin", cc_toolchain, feature_configuration, None)
     env.update(**linker_env)
     env["LD"] = linker
     env["LDFLAGS"] = " ".join(_pwd_flags(link_args))
@@ -200,7 +177,20 @@ def _cargo_build_script_impl(ctx):
     # Add environment variables from the Rust toolchain.
     env.update(toolchain.env)
 
-    env.update(expand_dict_value_locations(
+    # Gather data from the `toolchains` attribute.
+    for target in ctx.attr.toolchains:
+        if DefaultInfo in target:
+            toolchain_tools.extend([
+                target[DefaultInfo].files,
+                target[DefaultInfo].default_runfiles.files,
+            ])
+        if platform_common.ToolchainInfo in target:
+            all_files = getattr(target[platform_common.ToolchainInfo], "all_files", depset([]))
+            if type(all_files) == "list":
+                all_files = depset(all_files)
+            toolchain_tools.append(all_files)
+
+    _merge_env_dict(env, expand_dict_value_locations(
         ctx,
         ctx.attr.build_script_env,
         getattr(ctx.attr, "data", []) +
@@ -244,6 +234,9 @@ def _cargo_build_script_impl(ctx):
             build_script_inputs.append(dep_env_file)
             for dep_build_info in dep[rust_common.dep_info].transitive_build_infos.to_list():
                 build_script_inputs.append(dep_build_info.out_dir)
+
+    if feature_enabled(ctx, SYMLINK_EXEC_ROOT_FEATURE):
+        env["RULES_RUST_SYMLINK_EXEC_ROOT"] = "1"
 
     ctx.actions.run(
         executable = ctx.executable._cargo_build_script_runner,
@@ -340,6 +333,13 @@ cargo_build_script = rule(
     ],
     incompatible_use_toolchain_transition = True,
 )
+
+def _merge_env_dict(prefix_dict, suffix_dict):
+    """Merges suffix_dict into prefix_dict, appending rather than replacing certain env vars."""
+    for key in ["CFLAGS", "CXXFLAGS", "LDFLAGS"]:
+        if key in prefix_dict and key in suffix_dict and prefix_dict[key]:
+            prefix_dict[key] += " " + suffix_dict.pop(key)
+    prefix_dict.update(suffix_dict)
 
 def name_to_pkg_name(name):
     """Sanitize the name of cargo_build_script targets.

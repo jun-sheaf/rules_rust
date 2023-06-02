@@ -12,7 +12,13 @@ export RUNTIME_PWD="$(pwd)"
 if [[ -z "${{BAZEL_REAL:-}}" ]]; then
     BAZEL_REAL="$(which bazel || echo 'bazel')"
 fi
-eval exec env - BAZEL_REAL="${{BAZEL_REAL}}" BUILD_WORKSPACE_DIRECTORY="${{BUILD_WORKSPACE_DIRECTORY}}" {env} \\
+
+# The path needs to be preserved to prevent bazel from starting with different
+# startup options (requiring a restart of bazel).
+# If you provide an empty path, bazel starts itself with
+# --default_system_javabase set to the empty string, but if you provide a path,
+# it may set it to a value (eg. "/usr/local/buildtools/java/jdk11").
+eval exec env - BAZEL_REAL="${{BAZEL_REAL}}" BUILD_WORKSPACE_DIRECTORY="${{BUILD_WORKSPACE_DIRECTORY}}" PATH="${{PATH}}" {env} \\
 "{bin}" {args} "$@"
 """
 
@@ -26,18 +32,17 @@ call {bin} {args} %@%
 
 CARGO_BAZEL_GENERATOR_PATH = "CARGO_BAZEL_GENERATOR_PATH"
 
-def _runfiles_path(path, is_windows):
+def _runfiles_path(file, is_windows):
     if is_windows:
         runtime_pwd_var = "%RUNTIME_PWD%"
     else:
         runtime_pwd_var = "${RUNTIME_PWD}"
-    if path.startswith("../"):
-        return "{}/external/{}".format(runtime_pwd_var, path[len("../"):])
-    return "{}/{}".format(runtime_pwd_var, path)
+
+    return "{}/{}".format(runtime_pwd_var, file.short_path)
 
 def _is_windows(ctx):
     toolchain = ctx.toolchains[Label("@rules_rust//rust:toolchain_type")]
-    return "windows" in toolchain.target_triple
+    return toolchain.target_os == "windows"
 
 def _get_output_package(ctx):
     # Determine output directory
@@ -116,16 +121,17 @@ def _write_splicing_manifest(ctx):
 
     is_windows = _is_windows(ctx)
 
-    args = ["--splicing-manifest", _runfiles_path(manifest.short_path, is_windows)]
+    args = ["--splicing-manifest", _runfiles_path(manifest, is_windows)]
     runfiles = [manifest] + ctx.files.manifests + ([ctx.file.cargo_config] if ctx.attr.cargo_config else [])
     return args, runfiles
 
 def _write_config_file(ctx):
-    rendering_config = dict(json.decode(render_config(
-        regen_command = "bazel run {}".format(
-            ctx.label,
-        ),
-    )))
+    default_render_config = dict(json.decode(render_config()))
+
+    if ctx.attr.render_config:
+        rendering_config = dict(json.decode(ctx.attr.render_config))
+    else:
+        rendering_config = default_render_config
 
     output_pkg = _get_output_package(ctx)
 
@@ -142,7 +148,7 @@ def _write_config_file(ctx):
         build_file_base_template = "@{}//{}:BUILD.{{name}}-{{version}}.bazel"
         crate_label_template = rendering_config["crate_label_template"]
 
-    rendering_config.update({
+    updates = {
         "build_file_template": build_file_base_template.format(
             workspace_name,
             output_pkg,
@@ -153,10 +159,24 @@ def _write_config_file(ctx):
             output_pkg,
         ),
         "vendor_mode": ctx.attr.mode,
-    })
+    }
+
+    for key in updates:
+        if rendering_config[key] != default_render_config[key]:
+            fail("The `crates_vendor.render_config` attribute does not support the `{}` parameter. Please update {} to remove this value.".format(
+                key,
+                ctx.label,
+            ))
+
+    rendering_config.update(updates)
+
+    # Allow users to override the regen command.
+    if "regen_command" not in rendering_config or not rendering_config["regen_command"]:
+        rendering_config.update({"regen_command": "bazel run {}".format(ctx.label)})
 
     config_data = compile_config(
         crate_annotations = ctx.attr.annotations,
+        generate_binaries = ctx.attr.generate_binaries,
         generate_build_scripts = ctx.attr.generate_build_scripts,
         cargo_config = None,
         render_config = rendering_config,
@@ -174,7 +194,7 @@ def _write_config_file(ctx):
     )
 
     is_windows = _is_windows(ctx)
-    args = ["--config", _runfiles_path(config.short_path, is_windows)]
+    args = ["--config", _runfiles_path(config, is_windows)]
     runfiles = [config] + ctx.files.manifests
     return args, runfiles
 
@@ -183,8 +203,8 @@ def _crates_vendor_impl(ctx):
     is_windows = _is_windows(ctx)
 
     environ = {
-        "CARGO": _runfiles_path(toolchain.cargo.short_path, is_windows),
-        "RUSTC": _runfiles_path(toolchain.rustc.short_path, is_windows),
+        "CARGO": _runfiles_path(toolchain.cargo, is_windows),
+        "RUSTC": _runfiles_path(toolchain.rustc, is_windows),
     }
 
     args = ["vendor"]
@@ -195,7 +215,7 @@ def _crates_vendor_impl(ctx):
     if CARGO_BAZEL_GENERATOR_PATH in ctx.var:
         bin_path = ctx.var[CARGO_BAZEL_GENERATOR_PATH]
     elif ctx.executable.cargo_bazel:
-        bin_path = _runfiles_path(ctx.executable.cargo_bazel.short_path, is_windows)
+        bin_path = _runfiles_path(ctx.executable.cargo_bazel, is_windows)
         cargo_bazel_runfiles.append(ctx.executable.cargo_bazel)
     else:
         fail("{} is missing either the `cargo_bazel` attribute or the '{}' action env".format(
@@ -217,16 +237,21 @@ def _crates_vendor_impl(ctx):
     if ctx.attr.cargo_lockfile:
         args.extend([
             "--cargo-lockfile",
-            _runfiles_path(ctx.file.cargo_lockfile.short_path, is_windows),
+            _runfiles_path(ctx.file.cargo_lockfile, is_windows),
         ])
         cargo_bazel_runfiles.extend([ctx.file.cargo_lockfile])
 
     # Optionally include buildifier
     if ctx.attr.buildifier:
-        args.extend(["--buildifier", _runfiles_path(ctx.executable.buildifier.short_path, is_windows)])
+        args.extend(["--buildifier", _runfiles_path(ctx.executable.buildifier, is_windows)])
         cargo_bazel_runfiles.append(ctx.executable.buildifier)
 
-    # Dtermine platform specific settings
+    # Optionally include an explicit `bazel` path
+    if ctx.attr.bazel:
+        args.extend(["--bazel", _runfiles_path(ctx.executable.bazel, is_windows)])
+        cargo_bazel_runfiles.append(ctx.executable.bazel)
+
+    # Determine platform specific settings
     if is_windows:
         extension = ".bat"
         template = _WINDOWS_WRAPPER
@@ -325,8 +350,8 @@ call against the generated workspace. The following table describes how to contr
 
 | Value | Cargo command |
 | --- | --- |
-| Any of [`true`, `1`, `yes`, `on`] | `cargo update` |
-| `workspace` | `cargo update --workspace` |
+| Any of [`true`, `1`, `yes`, `on`, `workspace`] | `cargo update --workspace` |
+| Any of [`full`, `eager`, `all`] | `cargo update` |
 | `package_name` | `cargo upgrade --package package_name` |
 | `package_name@1.2.3` | `cargo upgrade --package package_name --precise 1.2.3` |
 
@@ -335,10 +360,17 @@ call against the generated workspace. The following table describes how to contr
         "annotations": attr.string_list_dict(
             doc = "Extra settings to apply to crates. See [crate.annotation](#crateannotation).",
         ),
+        "bazel": attr.label(
+            doc = "The path to a bazel binary used to locate the output_base for the current workspace.",
+            cfg = "exec",
+            executable = True,
+            allow_files = True,
+        ),
         "buildifier": attr.label(
             doc = "The path to a [buildifier](https://github.com/bazelbuild/buildtools/blob/5.0.1/buildifier/README.md) binary used to format generated BUILD files.",
             cfg = "exec",
             executable = True,
+            allow_files = True,
             default = Label("//crate_universe/private/vendor:buildifier"),
         ),
         "cargo_bazel": attr.label(
@@ -358,6 +390,13 @@ call against the generated workspace. The following table describes how to contr
         "cargo_lockfile": attr.label(
             doc = "The path to an existing `Cargo.lock` file",
             allow_single_file = True,
+        ),
+        "generate_binaries": attr.bool(
+            doc = (
+                "Whether to generate `rust_binary` targets for all the binary crates in every package. " +
+                "By default only the `rust_library` targets are generated."
+            ),
+            default = False,
         ),
         "generate_build_scripts": attr.bool(
             doc = (
@@ -384,6 +423,12 @@ call against the generated workspace. The following table describes how to contr
         ),
         "packages": attr.string_dict(
             doc = "A set of crates (packages) specifications to depend on. See [crate.spec](#crate.spec).",
+        ),
+        "render_config": attr.string(
+            doc = (
+                "The configuration flags to use for rendering. Use `//crate_universe:defs.bzl\\%render_config` to " +
+                "generate the value for this field. If unset, the defaults defined there will be used."
+            ),
         ),
         "repository_name": attr.string(
             doc = "The name of the repository to generate for `remote` vendor modes. If unset, the label name will be used",
