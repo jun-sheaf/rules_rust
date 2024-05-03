@@ -17,6 +17,8 @@
 # buildifier: disable=bzl-visibility
 load("//rust/private:utils.bzl", "name_to_crate_name")
 
+PROTO_TOOLCHAIN_TYPE = "@rules_proto//proto:toolchain_type"
+
 def generated_file_stem(file_path):
     """Returns the basename of a file without any extensions.
 
@@ -124,7 +126,7 @@ def _rust_proto_toolchain_impl(ctx):
         grpc_plugin = ctx.file.grpc_plugin,
         proto_compile_deps = ctx.attr.proto_compile_deps,
         proto_plugin = ctx.file.proto_plugin,
-        protoc = ctx.executable.protoc,
+        protoc = ctx.toolchains[PROTO_TOOLCHAIN_TYPE].proto.proto_compiler,
     )
 
 # Default dependencies needed to compile protobuf stubs.
@@ -167,13 +169,8 @@ rust_proto_toolchain = rule(
             cfg = "exec",
             default = Label("//proto/protobuf/3rdparty/crates:protobuf-codegen__protoc-gen-rust"),
         ),
-        "protoc": attr.label(
-            doc = "The location of the `protoc` binary. It should be an executable target.",
-            executable = True,
-            cfg = "exec",
-            default = Label("@com_google_protobuf//:protoc"),
-        ),
     },
+    toolchains = [PROTO_TOOLCHAIN_TYPE],
     doc = """\
 Declares a Rust Proto toolchain for use.
 

@@ -22,6 +22,7 @@ load("//rust/private:utils.bzl", "can_build_metadata")
 RUST_EDITION = "2021"
 
 TOOLCHAIN_TYPE = "@rules_rust//proto/prost:toolchain_type"
+PROTO_TOOLCHAIN_TYPE = "@rules_proto//proto:toolchain_type"
 
 def _create_proto_lang_toolchain(ctx, prost_toolchain):
     proto_lang_toolchain = proto_common.ProtoLangToolchainInfo(
@@ -347,13 +348,15 @@ def _rust_prost_toolchain_impl(ctx):
     if any(tonic_attrs) and not all(tonic_attrs):
         fail("When one tonic attribute is added, all must be added")
 
+    proto_compiler = ctx.toolchains[PROTO_TOOLCHAIN_TYPE].proto.proto_compiler
+
     return [platform_common.ToolchainInfo(
         prost_opts = ctx.attr.prost_opts,
         prost_plugin = ctx.attr.prost_plugin,
         prost_plugin_flag = ctx.attr.prost_plugin_flag,
         prost_runtime = ctx.attr.prost_runtime,
         prost_types = ctx.attr.prost_types,
-        proto_compiler = ctx.attr.proto_compiler,
+        proto_compiler = proto_compiler,
         protoc_opts = ctx.fragments.proto.experimental_protoc_opts,
         tonic_opts = ctx.attr.tonic_opts,
         tonic_plugin = ctx.attr.tonic_plugin,
@@ -389,12 +392,6 @@ rust_prost_toolchain = rule(
             providers = [[rust_common.crate_info], [rust_common.crate_group_info]],
             mandatory = True,
         ),
-        "proto_compiler": attr.label(
-            doc = "The protoc compiler to use.",
-            cfg = "exec",
-            executable = True,
-            mandatory = True,
-        ),
         "tonic_opts": attr.string_list(
             doc = "Additional options to add to Tonic.",
         ),
@@ -412,6 +409,7 @@ rust_prost_toolchain = rule(
             providers = [[rust_common.crate_info], [rust_common.crate_group_info]],
         ),
     },
+    toolchains = [PROTO_TOOLCHAIN_TYPE],
 )
 
 def _current_prost_runtime_impl(ctx):
